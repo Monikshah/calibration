@@ -9,62 +9,16 @@ import pickle
 import calibration_model as cm
 import torch.nn as nn
 import torch.optim as optim
+import matplotlib.pyplot as plt
+import utility as ut
+from sklearn.calibration import calibration_curve, CalibrationDisplay
 
-
-device = "cuda" if torch.cuda.is_available() else "cpu"
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 TRAIN_IMAGE_DIRECTORY = "/home/monika/Downloads/train2014"
+VAL_IMAGE_DIRECTORY = "/home/monika/Downloads/val2014"
 COCO_DATA_DIRECTORY = "/home/monika/Documents/PhD-Project/MLN-Caption-Verification-bkup/MLN-Caption-Verification/coco-caption"
-
 model, transform = clip.load("ViT-B/32", device=device)
 state = "train"
-
-
-class CocoDataset(Dataset):
-    def __init__(self, image_ids, coco, transform, image_dir):
-        self.image_ids = image_ids
-        self.coco = coco
-        self.transform = transform
-        self.image_dir = image_dir
-
-    def __len__(self):
-        return len(self.image_ids)
-
-    def __getitem__(self, idx):
-        image_id = self.image_ids[idx]
-        image_path = os.path.join(
-            self.image_dir, "COCO_train2014_" + "{:012d}".format(image_id) + ".jpg"
-        )
-        image = Image.open(image_path).convert("RGB")
-        image = self.transform(image)
-        ann_ids = self.coco.getAnnIds(imgIds=image_id)
-        captions = [self.coco.loadAnns(ann_id)[0]["caption"] for ann_id in ann_ids]
-
-        return image_id, image, captions
-
-
-def collate_fn(batch):
-    image_ids, images, captions = zip(*batch)
-    images = torch.stack(images)
-    return image_ids, images, captions
-
-
-def clipEmbeddingBatch(image_ids, images, captions):
-    image_embeddings = model.encode_image(images.to(device))
-    combined_embeddings = []
-    for i, caption_list in enumerate(captions):
-        tmp = []
-        for caption in caption_list:
-            text = clip.tokenize([caption]).to(device)
-            t_embedding = model.encode_text(text)
-            tmp.append(t_embedding.cpu().detach().numpy())
-        text_embedding = np.mean(np.array(tmp), axis=0)
-        image_embedding = image_embeddings[i].cpu().detach().numpy()
-        concatenated_embedding = np.concatenate(
-            (text_embedding, image_embedding), axis=None
-        )
-        combined_embeddings.append(concatenated_embedding)
-
-    return np.array(combined_embeddings)
 
 
 def getCocoObject(captionorInstance, dataType):
@@ -78,70 +32,186 @@ def getCocoObject(captionorInstance, dataType):
 
 
 def generatedCaptions(imageid, data):
-    captions = tuple([data[str(id)] for id in imageid])
-
+    captions = tuple([data[id] for id in imageid])  # str(id)
     return captions
 
 
 def main():
     coco = getCocoObject("captions", state + "2014")
     imgIds = coco.getImgIds()
+    train_dataset = ut.CocoDataset(imgIds, coco, TRAIN_IMAGE_DIRECTORY, "train")
 
-    dataset = CocoDataset(imgIds, coco, transform, TRAIN_IMAGE_DIRECTORY)
     dataloader = DataLoader(
-        dataset, batch_size=cm.BATCH_SIZE, shuffle=True, collate_fn=collate_fn
+        train_dataset,
+        batch_size=cm.BATCH_SIZE,
+        num_workers=4,
+        shuffle=True,
+        collate_fn=ut.collate_fn,
     )
 
-    # READ the generated captions
+    val_data_file_GEN = (
+        "./../Caption_Verification_HMLN_CVPR/captionGenTest/m2genCaptionVal.json"
+    )
+    val_data_GEN = ut.getCaption(val_data_file_GEN)
+    valimgIds_GEN = [id for id in val_data_GEN][:2500]
+    coco = getCocoObject("captions", "val" + "2014")
+    # imgIds = coco.getImgIds()[:2500]
+    val_dataset = ut.CocoDataset(valimgIds_GEN, coco, VAL_IMAGE_DIRECTORY, "val")
+
+    # val_dataset = ut.ValTestDataset(valimgIds, val_data, VAL_IMAGE_DIRECTORY, "val")
+    val_dataloader = DataLoader(
+        val_dataset, batch_size=cm.BATCH_SIZE, shuffle=False, collate_fn=ut.collate_fn
+    )
+
+    # READ the TRAIN SET generated captions
     with open(
-        "/home/monika/Documents/PhD-Project/meshed-memory-transformer/output_logs/m2genCaptionTrain_withimageids.pickle",
+        "/home/monika/Documents/PhD-Project/MESHED-MEMORY-TRANSFORMER/output_logs/m2genCaptionTrain_withimageids.pickle",
         "rb",
     ) as handle:
-        data = pickle.load(handle)
+        traindata = pickle.load(handle)
 
-    labels_0 = torch.zeros(cm.BATCH_SIZE, dtype=torch.long).to(device)
-    labels_1 = torch.ones(cm.BATCH_SIZE, dtype=torch.long).to(device)
+    criterion = nn.BCELoss()  # nn.CrossEntropyLoss()
+    _model = cm.MLP(cm.input_size, cm.hidden_size, cm.num_classes).to(device)
+    optimizer = optim.Adam(_model.parameters(), lr=cm.learning_rate)
 
-    criterion = nn.CrossEntropyLoss()
-    # optimizer = optim.Adam(model.parameters(), lr=cm.learning_rate)
-    # model = cm.MLP(cm.input_size, cm.hidden_size, cm.num_classes).to(device)
-    model = cm.MLP(cm.input_size, cm.hidden_size, cm.num_classes).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=cm.learning_rate)
-
+    train_losses = []
+    val_losses = []
     for epoch in range(cm.num_epoch):
-        model.train
+        _model.train()
+        epoch_loss = 0
         for batch_idx, (image_ids, images, captions) in enumerate(dataloader):
-            combined_embeddings_GT = clipEmbeddingBatch(image_ids, images, captions)
-            captions_GEN = generatedCaptions(image_ids, data)
-            combined_embeddings_GEN = clipEmbeddingBatch(
-                image_ids, images, captions_GEN
+            embeddings_GT = ut.clipEmbeddingBatch(image_ids, images, captions)
+            embeddings_GT = torch.tensor(embeddings_GT, dtype=torch.float32).to(device)
+            image_ids_ = [str(id) for id in image_ids]
+            captions_GEN = generatedCaptions(image_ids_, traindata)
+            embeddings_GEN = ut.clipEmbeddingBatch(image_ids, images, captions_GEN)
+            embeddings_GEN = torch.tensor(embeddings_GEN, dtype=torch.float32).to(
+                device
             )
-            combined_embeddings_GT = torch.Tensor(combined_embeddings_GT).to(device)
-            combined_embeddings_GEN = torch.Tensor(combined_embeddings_GEN).to(device)
-            outputs = model(combined_embeddings_GT)
-            loss = criterion(outputs, labels_0)
+            combined_embeddings = torch.cat((embeddings_GT, embeddings_GEN), 0)
+            batch_size = embeddings_GT.size(0)
+            labels_0 = torch.zeros(batch_size, dtype=torch.float32).to(device)
+            labels_1 = torch.ones(batch_size, dtype=torch.float32).to(device)
+            labels = torch.cat((labels_0, labels_1), 0).view(-1, 1)
+
+            outputs = _model(combined_embeddings)
+            loss = criterion(outputs, labels)
+            epoch_loss += loss.item()
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
-            if (batch_idx + 1) % 10 == 0:
+            if (batch_idx + 1) % 100 == 0:
                 print(
                     f"Epoch [{epoch+1}/{cm.num_epoch}], Step [{batch_idx+1}/{len(dataloader)}], Loss: {loss.item():.4f}"
                 )
 
-            outputs = model(combined_embeddings_GEN)
-            loss = criterion(outputs, labels_1)
+        avg_epoch_loss = epoch_loss / len(dataloader)
+        train_losses.append(avg_epoch_loss)
+        print(
+            f"Epoch [{epoch+1}/{cm.num_epoch}], Average Training Loss: {avg_epoch_loss:.4f}"
+        )
 
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            if (batch_idx + 1) % 10 == 0:
-                print(
-                    f"Epoch [{epoch+1}/{cm.num_epoch}], Step [{batch_idx+1}/{len(dataloader)}], Loss: {loss.item():.4f}"
+        _model.eval()
+        val_epoch_loss = 0
+        with torch.no_grad():
+            start = 0
+            for batch_idx, (image_ids, images, captions) in enumerate(val_dataloader):
+                valembeddings_GT = ut.clipEmbeddingBatch(image_ids, images, captions)
+                valembeddings_GT = torch.tensor(
+                    valembeddings_GT, dtype=torch.float32
+                ).to(device)
+                # valimgIds_GEN = valimgIds_GEN[start : start + cm.BATCH_SIZE]
+                start += cm.BATCH_SIZE
+                captions_GEN = generatedCaptions(image_ids, val_data_GEN)
+                embeddings_GEN = ut.clipEmbeddingBatch(
+                    image_ids,
+                    images,
+                    captions_GEN,
                 )
+                embeddings_GEN = torch.tensor(embeddings_GEN, dtype=torch.float32).to(
+                    device
+                )
+                combined_embeddings = torch.cat((valembeddings_GT, embeddings_GEN), 0)
+                batch_size = valembeddings_GT.size(0)
+                labels_0 = torch.zeros(batch_size, dtype=torch.float32).to(device)
+                labels_1 = torch.ones(batch_size, dtype=torch.float32).to(device)
+                labels = torch.cat((labels_0, labels_1), 0).view(-1, 1)
+                outputs = _model(combined_embeddings)
+                loss = criterion(outputs, labels)
+                val_epoch_loss += loss.item()
+
+        avg_val_loss = val_epoch_loss / len(val_dataloader)
+        val_losses.append(avg_val_loss)
+        print(
+            f"Epoch [{epoch+1}/{cm.num_epoch}], Average Validation Loss: {avg_val_loss:.4f}"
+        )
+
+    torch.save(_model.state_dict(), "data/model.pth")
+    print("Model saved to data/model.pth")
+
+    plt.plot(train_losses, label="Training Loss")
+    plt.plot(val_losses, label="Validation Loss")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title("Training and Validation Loss per Epoch")
+    plt.legend()
+    plt.show()
 
 
-if __name__ == "__main__":
-    main()
+def Calibration():
+    val_data_file_GEN = (
+        "./../Caption_Verification_HMLN_CVPR/captionGenTest/m2genCaptionVal.json"
+    )
+    val_data_GEN = ut.getCaption(val_data_file_GEN)
+    valimgIds_GEN = [id for id in val_data_GEN][:2500]
+    coco = getCocoObject("captions", "val" + "2014")
+    # imgIds = coco.getImgIds()[:2500]
+    val_dataset = ut.CocoDataset(valimgIds_GEN, coco, VAL_IMAGE_DIRECTORY, "val")
+
+    # val_dataset = ut.ValTestDataset(valimgIds, val_data, VAL_IMAGE_DIRECTORY, "val")
+    val_dataloader = DataLoader(
+        val_dataset, batch_size=cm.BATCH_SIZE, shuffle=False, collate_fn=ut.collate_fn
+    )
+    _model = cm.MLP(cm.input_size, cm.hidden_size, cm.num_classes).to(device)
+    _model.load_state_dict(torch.load("data/model.pth"))
+    _model.eval()
+    with torch.no_grad():
+        start = 0
+        for batch_idx, (image_ids, images, captions) in enumerate(val_dataloader):
+            valembeddings_GT = ut.clipEmbeddingBatch(image_ids, images, captions)
+            valembeddings_GT = torch.tensor(valembeddings_GT, dtype=torch.float32).to(
+                device
+            )
+            # valimgIds_GEN = valimgIds_GEN[start : start + cm.BATCH_SIZE]
+            start += cm.BATCH_SIZE
+            captions_GEN = generatedCaptions(image_ids, val_data_GEN)
+            embeddings_GEN = ut.clipEmbeddingBatch(
+                image_ids,
+                images,
+                captions_GEN,
+            )
+            embeddings_GEN = torch.tensor(embeddings_GEN, dtype=torch.float32).to(
+                device
+            )
+            combined_embeddings = torch.cat((valembeddings_GT, embeddings_GEN), 0)
+            batch_size = valembeddings_GT.size(0)
+            labels_0 = torch.zeros(batch_size, dtype=torch.float32).to(device)
+            labels_1 = torch.ones(batch_size, dtype=torch.float32).to(device)
+            labels = torch.cat((labels_0, labels_1), 0).view(-1, 1)
+            outputs = _model(combined_embeddings)
+
+            # prob_true, prob_pred = calibration_curve(
+            # labels.cpu(), outputs.cpu(), n_bins=10
+            # )
+            disp = CalibrationDisplay.from_predictions(labels.cpu(), outputs.cpu())
+            plt.show()
+
+            # break
+
+
+Calibration()
+
+# if __name__ == "__main__":
+# main()
